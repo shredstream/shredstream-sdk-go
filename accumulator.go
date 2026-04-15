@@ -1,6 +1,13 @@
 package shredstream
 
-const gapSkipThreshold = 5
+import "errors"
+
+const (
+	gapSkipThreshold   = 5
+	maxAwaitingSkipped = 64
+)
+
+var errResync = errors.New("shredstream: resync needed")
 
 type pendingShred struct {
 	payload       []byte
@@ -9,11 +16,13 @@ type pendingShred struct {
 }
 
 type SlotAccumulator struct {
-	pending      map[uint32]pendingShred
-	decoder      *BatchDecoder
-	nextDrain    uint32
-	stallCount   uint32
-	SlotComplete bool
+	pending            map[uint32]pendingShred
+	decoder            *BatchDecoder
+	nextDrain          uint32
+	stallCount         uint32
+	awaitingBatchStart bool
+	awaitingSkipped    uint32
+	SlotComplete       bool
 }
 
 func NewSlotAccumulator() *SlotAccumulator {
@@ -54,6 +63,8 @@ func (a *SlotAccumulator) Push(index uint32, payload []byte, batchComplete, last
 			a.nextDrain = minIdx
 			a.stallCount = 0
 			a.decoder.Reset()
+			a.awaitingBatchStart = true
+			a.awaitingSkipped = 0
 
 			moreTxs, _, err := a.drainConsecutive()
 			if err != nil {
@@ -79,6 +90,17 @@ func (a *SlotAccumulator) drainConsecutive() ([]Transaction, bool, error) {
 		delete(a.pending, a.nextDrain)
 		a.nextDrain++
 		drained = true
+
+		if a.awaitingBatchStart {
+			a.awaitingSkipped++
+			if shred.batchComplete {
+				a.awaitingBatchStart = false
+				a.awaitingSkipped = 0
+			} else if a.awaitingSkipped >= maxAwaitingSkipped {
+				return allTxs, drained, errResync
+			}
+			continue
+		}
 
 		txs, err := a.decoder.Push(shred.payload)
 		if err != nil {

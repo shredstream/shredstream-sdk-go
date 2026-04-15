@@ -6,6 +6,11 @@ import (
 	"math/big"
 )
 
+const (
+	maxTxPerEntry      = 10_000
+	maxSignaturesPerTx = 64
+)
+
 type Transaction struct {
 	Signatures [][]byte
 	Raw        []byte
@@ -64,7 +69,14 @@ func (d *BatchDecoder) Reset() {
 	d.cursor = 0
 }
 
-func (d *BatchDecoder) Push(payload []byte) ([]Transaction, error) {
+func (d *BatchDecoder) Push(payload []byte) (txs []Transaction, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			txs = nil
+			err = fmt.Errorf("decoder panic: %v", r)
+		}
+	}()
+
 	d.buffer = append(d.buffer, payload...)
 
 	if d.expectedCount == nil {
@@ -78,8 +90,6 @@ func (d *BatchDecoder) Push(payload []byte) ([]Transaction, error) {
 		d.expectedCount = &count
 		d.cursor = 8
 	}
-
-	var txs []Transaction
 
 	for d.entriesYielded < *d.expectedCount {
 		entryTxs, err := d.tryDecodeEntry()
@@ -106,6 +116,9 @@ func (d *BatchDecoder) tryDecodeEntry() ([]Transaction, error) {
 
 	pos += 8 + 32
 	txCount := binary.LittleEndian.Uint64(buf[pos:])
+	if txCount > maxTxPerEntry {
+		return nil, fmt.Errorf("corrupt tx_count: %d exceeds limit", txCount)
+	}
 	pos += 8
 
 	txs := make([]Transaction, 0, txCount)
@@ -146,6 +159,9 @@ func parseTransaction(buf []byte, pos int) (int, [][]byte, error) {
 	sigCount, n := decodeCompactU16(buf, pos)
 	if n < 0 {
 		return -1, nil, nil
+	}
+	if sigCount > maxSignaturesPerTx {
+		return -1, nil, fmt.Errorf("corrupt sig_count: %d exceeds limit", sigCount)
 	}
 	pos += n
 
