@@ -3,324 +3,414 @@ package shredstream
 import (
 	"encoding/binary"
 	"fmt"
-	"math/big"
 )
 
-const (
-	maxTxPerEntry      = 10_000
-	maxSignaturesPerTx = 64
-)
+const maxEntryCount uint64 = 50_000
 
-type Transaction struct {
-	Signatures [][]byte
-	Raw        []byte
+const initialBufferCapacity = 64 * 1024
+
+type Signature [64]byte
+type Pubkey [32]byte
+type Hash [32]byte
+
+type MessageHeader struct {
+	NumRequiredSignatures       uint8
+	NumReadonlySignedAccounts   uint8
+	NumReadonlyUnsignedAccounts uint8
 }
 
-const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+type CompiledInstruction struct {
+	ProgramIDIndex uint8
+	Accounts       []byte
+	Data           []byte
+}
 
-func encodeBase58(b []byte) string {
-	x := new(big.Int).SetBytes(b)
-	mod := new(big.Int)
-	zero := big.NewInt(0)
-	base := big.NewInt(58)
+type MessageAddressTableLookup struct {
+	AccountKey      Pubkey
+	WritableIndexes []byte
+	ReadonlyIndexes []byte
+}
 
-	var result []byte
-	for x.Cmp(zero) > 0 {
-		x.DivMod(x, base, mod)
-		result = append(result, base58Alphabet[mod.Int64()])
+type VersionedMessage struct {
+	IsV0                bool
+	Header              MessageHeader
+	AccountKeys         []Pubkey
+	RecentBlockhash     Hash
+	Instructions        []CompiledInstruction
+	AddressTableLookups []MessageAddressTableLookup
+}
+
+type VersionedTransaction struct {
+	Signatures []Signature
+	Message    VersionedMessage
+}
+
+type StreamingDecoder struct {
+	buffer           []byte
+	cursor           int
+	expectedCount    uint64
+	expectedCountSet bool
+	entriesYielded   uint64
+}
+
+func NewStreamingDecoder() *StreamingDecoder {
+	return &StreamingDecoder{
+		buffer: make([]byte, 0, initialBufferCapacity),
 	}
-
-	for _, v := range b {
-		if v != 0 {
-			break
-		}
-		result = append(result, '1')
-	}
-
-	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
-		result[i], result[j] = result[j], result[i]
-	}
-
-	return string(result)
 }
 
-func (tx *Transaction) Signature() string {
-	if len(tx.Signatures) == 0 {
-		return ""
-	}
-	return encodeBase58(tx.Signatures[0])
-}
-
-type BatchDecoder struct {
-	buffer         []byte
-	expectedCount  *uint64
-	entriesYielded uint64
-	cursor         int
-}
-
-func NewBatchDecoder() *BatchDecoder {
-	return &BatchDecoder{}
-}
-
-func (d *BatchDecoder) Reset() {
+func (d *StreamingDecoder) Reset() {
 	d.buffer = d.buffer[:0]
-	d.expectedCount = nil
-	d.entriesYielded = 0
 	d.cursor = 0
+	d.expectedCount = 0
+	d.expectedCountSet = false
+	d.entriesYielded = 0
 }
 
-func (d *BatchDecoder) Push(payload []byte) (txs []Transaction, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			txs = nil
-			err = fmt.Errorf("decoder panic: %v", r)
-		}
-	}()
-
+func (d *StreamingDecoder) Push(payload []byte) ([]VersionedTransaction, error) {
 	d.buffer = append(d.buffer, payload...)
-
-	if d.expectedCount == nil {
-		if len(d.buffer) < 8 {
-			return nil, nil
-		}
-		count := binary.LittleEndian.Uint64(d.buffer[0:8])
-		if count > 100_000 {
-			return nil, fmt.Errorf("corrupt entry_count: %d exceeds limit", count)
-		}
-		d.expectedCount = &count
-		d.cursor = 8
-	}
-
-	for d.entriesYielded < *d.expectedCount {
-		entryTxs, err := d.tryDecodeEntry()
-		if err != nil {
-			return txs, err
-		}
-		if entryTxs == nil {
-			break
-		}
-		txs = append(txs, entryTxs...)
-		d.entriesYielded++
-	}
-
-	return txs, nil
+	return d.tryDeserialize()
 }
 
-func (d *BatchDecoder) tryDecodeEntry() ([]Transaction, error) {
-	pos := d.cursor
-	buf := d.buffer
+func (d *StreamingDecoder) tryDeserialize() ([]VersionedTransaction, error) {
+	if !d.expectedCountSet && len(d.buffer) >= d.cursor+8 {
+		count := binary.LittleEndian.Uint64(d.buffer[d.cursor : d.cursor+8])
+		if count > maxEntryCount {
+			return nil, &DecodeError{Msg: "invalid entry count"}
+		}
+		d.cursor += 8
+		d.expectedCount = count
+		d.expectedCountSet = true
+	}
 
-	if pos+48 > len(buf) {
+	if !d.expectedCountSet {
 		return nil, nil
 	}
 
-	pos += 8 + 32
-	txCount := binary.LittleEndian.Uint64(buf[pos:])
-	if txCount > maxTxPerEntry {
-		return nil, fmt.Errorf("corrupt tx_count: %d exceeds limit", txCount)
-	}
-	pos += 8
-
-	txs := make([]Transaction, 0, txCount)
-
-	for i := uint64(0); i < txCount; i++ {
-		txStart := pos
-
-		txLen, sigs, err := parseTransaction(buf, pos)
+	var txs []VersionedTransaction
+	for d.entriesYielded < d.expectedCount {
+		if d.cursor >= len(d.buffer) {
+			break
+		}
+		consumed, entryTxs, complete, err := decodeEntry(d.buffer[d.cursor:])
 		if err != nil {
-			return nil, fmt.Errorf("parsing tx %d: %w", i, err)
+			return nil, err
 		}
-		if txLen < 0 {
-			return nil, nil
+		if !complete {
+			break
 		}
-
-		txEnd := pos + txLen
-		txRaw := make([]byte, txLen)
-		copy(txRaw, buf[txStart:txEnd])
-
-		txs = append(txs, Transaction{
-			Signatures: sigs,
-			Raw:        txRaw,
-		})
-
-		pos = txEnd
+		d.cursor += consumed
+		d.entriesYielded++
+		txs = append(txs, entryTxs...)
 	}
-
-	d.cursor = pos
 	return txs, nil
 }
 
-func parseTransaction(buf []byte, pos int) (int, [][]byte, error) {
-	start := pos
-
-	if pos >= len(buf) {
-		return -1, nil, nil
+func DecodeBatch(b []byte) ([]VersionedTransaction, error) {
+	if !validateVecPrefix(b) {
+		return nil, nil
 	}
-	sigCount, n := decodeCompactU16(buf, pos)
-	if n < 0 {
-		return -1, nil, nil
-	}
-	if sigCount > maxSignaturesPerTx {
-		return -1, nil, fmt.Errorf("corrupt sig_count: %d exceeds limit", sigCount)
-	}
-	pos += n
-
-	sigsEnd := pos + sigCount*64
-	if sigsEnd > len(buf) {
-		return -1, nil, nil
-	}
-
-	sigs := make([][]byte, sigCount)
-	for i := 0; i < sigCount; i++ {
-		sig := make([]byte, 64)
-		copy(sig, buf[pos:pos+64])
-		sigs[i] = sig
-		pos += 64
-	}
-
-	if pos >= len(buf) {
-		return -1, nil, nil
-	}
-	msgFirst := buf[pos]
-	isV0 := msgFirst >= 0x80
-
-	if isV0 {
-		pos++
-	}
-
-	pos += 3
-	if pos > len(buf) {
-		return -1, nil, nil
-	}
-
-	if pos >= len(buf) {
-		return -1, nil, nil
-	}
-	acctCount, n := decodeCompactU16(buf, pos)
-	if n < 0 {
-		return -1, nil, nil
-	}
-	pos += n
-	pos += acctCount * 32
-	if pos > len(buf) {
-		return -1, nil, nil
-	}
-
-	pos += 32
-	if pos > len(buf) {
-		return -1, nil, nil
-	}
-
-	if pos >= len(buf) {
-		return -1, nil, nil
-	}
-	ixCount, n := decodeCompactU16(buf, pos)
-	if n < 0 {
-		return -1, nil, nil
-	}
-	pos += n
-
-	for ix := 0; ix < ixCount; ix++ {
-		pos++
-		if pos > len(buf) {
-			return -1, nil, nil
+	count := binary.LittleEndian.Uint64(b[:8])
+	pos := 8
+	var txs []VersionedTransaction
+	for i := uint64(0); i < count; i++ {
+		if pos >= len(b) {
+			return nil, &DecodeError{Msg: "truncated batch"}
 		}
-
-		if pos >= len(buf) {
-			return -1, nil, nil
+		consumed, entryTxs, complete, err := decodeEntry(b[pos:])
+		if err != nil {
+			return nil, err
 		}
-		acctLen, n := decodeCompactU16(buf, pos)
-		if n < 0 {
-			return -1, nil, nil
+		if !complete {
+			return nil, &DecodeError{Msg: "truncated entry"}
 		}
-		pos += n
-		pos += acctLen
-		if pos > len(buf) {
-			return -1, nil, nil
-		}
-
-		if pos >= len(buf) {
-			return -1, nil, nil
-		}
-		dataLen, n := decodeCompactU16(buf, pos)
-		if n < 0 {
-			return -1, nil, nil
-		}
-		pos += n
-		pos += dataLen
-		if pos > len(buf) {
-			return -1, nil, nil
-		}
+		pos += consumed
+		txs = append(txs, entryTxs...)
 	}
-
-	if isV0 {
-		if pos >= len(buf) {
-			return -1, nil, nil
-		}
-		atlCount, n := decodeCompactU16(buf, pos)
-		if n < 0 {
-			return -1, nil, nil
-		}
-		pos += n
-
-		for atl := 0; atl < atlCount; atl++ {
-			pos += 32
-			if pos > len(buf) {
-				return -1, nil, nil
-			}
-
-			if pos >= len(buf) {
-				return -1, nil, nil
-			}
-			wLen, n := decodeCompactU16(buf, pos)
-			if n < 0 {
-				return -1, nil, nil
-			}
-			pos += n
-			pos += wLen
-			if pos > len(buf) {
-				return -1, nil, nil
-			}
-
-			if pos >= len(buf) {
-				return -1, nil, nil
-			}
-			rLen, n := decodeCompactU16(buf, pos)
-			if n < 0 {
-				return -1, nil, nil
-			}
-			pos += n
-			pos += rLen
-			if pos > len(buf) {
-				return -1, nil, nil
-			}
-		}
-	}
-
-	return pos - start, sigs, nil
+	return txs, nil
 }
 
-func decodeCompactU16(buf []byte, pos int) (int, int) {
-	if pos >= len(buf) {
-		return 0, -1
+func DecodeConcatenated(b []byte) []VersionedTransaction {
+	var out []VersionedTransaction
+	offset := 0
+	for offset+8 <= len(b) {
+		remaining := b[offset:]
+		if !validateVecPrefix(remaining) {
+			break
+		}
+		count := binary.LittleEndian.Uint64(remaining[:8])
+		pos := 8
+		var batchTxs []VersionedTransaction
+		ok := true
+		for i := uint64(0); i < count; i++ {
+			if pos >= len(remaining) {
+				ok = false
+				break
+			}
+			consumed, entryTxs, complete, err := decodeEntry(remaining[pos:])
+			if err != nil || !complete {
+				ok = false
+				break
+			}
+			pos += consumed
+			batchTxs = append(batchTxs, entryTxs...)
+		}
+		if !ok || pos == 0 {
+			break
+		}
+		out = append(out, batchTxs...)
+		offset += pos
+	}
+	return out
+}
+
+func validateVecPrefix(b []byte) bool {
+	if len(b) < 8 {
+		return false
+	}
+	count := binary.LittleEndian.Uint64(b[:8])
+	if count > maxEntryCount {
+		return false
+	}
+	if count > 0 && count*48 > uint64(len(b)) {
+		return false
+	}
+	return true
+}
+
+func decodeEntry(b []byte) (int, []VersionedTransaction, bool, error) {
+	if len(b) < 8+32+8 {
+		return 0, nil, false, nil
+	}
+	pos := 0
+	pos += 8
+	pos += 32
+	txCount := binary.LittleEndian.Uint64(b[pos : pos+8])
+	pos += 8
+	remaining := uint64(len(b) - pos)
+	if txCount > remaining {
+		return 0, nil, false, &DecodeError{Msg: fmt.Sprintf("invalid tx count: %d", txCount)}
+	}
+	txs := make([]VersionedTransaction, 0, txCount)
+	for i := uint64(0); i < txCount; i++ {
+		consumed, tx, complete, err := decodeTransaction(b[pos:])
+		if err != nil {
+			return 0, nil, false, err
+		}
+		if !complete {
+			return 0, nil, false, nil
+		}
+		pos += consumed
+		txs = append(txs, tx)
+	}
+	return pos, txs, true, nil
+}
+
+func decodeTransaction(b []byte) (int, VersionedTransaction, bool, error) {
+	pos := 0
+	sigCount, n := decodeCompactU16(b, pos)
+	if n < 0 {
+		return 0, VersionedTransaction{}, false, nil
+	}
+	pos += n
+	if sigCount > 256 {
+		return 0, VersionedTransaction{}, false, &DecodeError{Msg: "sig count too large"}
+	}
+	if pos+sigCount*64 > len(b) {
+		return 0, VersionedTransaction{}, false, nil
+	}
+	sigs := make([]Signature, sigCount)
+	for i := 0; i < sigCount; i++ {
+		copy(sigs[i][:], b[pos:pos+64])
+		pos += 64
+	}
+	consumed, msg, complete, err := decodeMessage(b[pos:])
+	if err != nil {
+		return 0, VersionedTransaction{}, false, err
+	}
+	if !complete {
+		return 0, VersionedTransaction{}, false, nil
+	}
+	pos += consumed
+	return pos, VersionedTransaction{Signatures: sigs, Message: msg}, true, nil
+}
+
+func decodeMessage(b []byte) (int, VersionedMessage, bool, error) {
+	if len(b) < 1 {
+		return 0, VersionedMessage{}, false, nil
+	}
+	pos := 0
+	first := b[pos]
+	isV0 := first&0x80 != 0
+	if isV0 {
+		if first&0x7F != 0 {
+			return 0, VersionedMessage{}, false, &DecodeError{Msg: "unknown message version"}
+		}
+		pos++
+	}
+	if pos+3 > len(b) {
+		return 0, VersionedMessage{}, false, nil
+	}
+	header := MessageHeader{
+		NumRequiredSignatures:       b[pos],
+		NumReadonlySignedAccounts:   b[pos+1],
+		NumReadonlyUnsignedAccounts: b[pos+2],
+	}
+	pos += 3
+
+	acctCount, n := decodeCompactU16(b, pos)
+	if n < 0 {
+		return 0, VersionedMessage{}, false, nil
+	}
+	pos += n
+	if pos+acctCount*32 > len(b) {
+		return 0, VersionedMessage{}, false, nil
+	}
+	accountKeys := make([]Pubkey, acctCount)
+	for i := 0; i < acctCount; i++ {
+		copy(accountKeys[i][:], b[pos:pos+32])
+		pos += 32
 	}
 
-	b0 := buf[pos]
+	if pos+32 > len(b) {
+		return 0, VersionedMessage{}, false, nil
+	}
+	var blockhash Hash
+	copy(blockhash[:], b[pos:pos+32])
+	pos += 32
+
+	ixCount, n := decodeCompactU16(b, pos)
+	if n < 0 {
+		return 0, VersionedMessage{}, false, nil
+	}
+	pos += n
+	instructions := make([]CompiledInstruction, 0, ixCount)
+	for i := 0; i < ixCount; i++ {
+		if pos+1 > len(b) {
+			return 0, VersionedMessage{}, false, nil
+		}
+		programID := b[pos]
+		pos++
+		acctLen, n := decodeCompactU16(b, pos)
+		if n < 0 {
+			return 0, VersionedMessage{}, false, nil
+		}
+		pos += n
+		if pos+acctLen > len(b) {
+			return 0, VersionedMessage{}, false, nil
+		}
+		accounts := make([]byte, acctLen)
+		copy(accounts, b[pos:pos+acctLen])
+		pos += acctLen
+
+		dataLen, n := decodeCompactU16(b, pos)
+		if n < 0 {
+			return 0, VersionedMessage{}, false, nil
+		}
+		pos += n
+		if pos+dataLen > len(b) {
+			return 0, VersionedMessage{}, false, nil
+		}
+		data := make([]byte, dataLen)
+		copy(data, b[pos:pos+dataLen])
+		pos += dataLen
+
+		instructions = append(instructions, CompiledInstruction{
+			ProgramIDIndex: programID,
+			Accounts:       accounts,
+			Data:           data,
+		})
+	}
+
+	var atls []MessageAddressTableLookup
+	if isV0 {
+		atlCount, n := decodeCompactU16(b, pos)
+		if n < 0 {
+			return 0, VersionedMessage{}, false, nil
+		}
+		pos += n
+		atls = make([]MessageAddressTableLookup, 0, atlCount)
+		for i := 0; i < atlCount; i++ {
+			if pos+32 > len(b) {
+				return 0, VersionedMessage{}, false, nil
+			}
+			var key Pubkey
+			copy(key[:], b[pos:pos+32])
+			pos += 32
+
+			wLen, n := decodeCompactU16(b, pos)
+			if n < 0 {
+				return 0, VersionedMessage{}, false, nil
+			}
+			pos += n
+			if pos+wLen > len(b) {
+				return 0, VersionedMessage{}, false, nil
+			}
+			writable := make([]byte, wLen)
+			copy(writable, b[pos:pos+wLen])
+			pos += wLen
+
+			rLen, n := decodeCompactU16(b, pos)
+			if n < 0 {
+				return 0, VersionedMessage{}, false, nil
+			}
+			pos += n
+			if pos+rLen > len(b) {
+				return 0, VersionedMessage{}, false, nil
+			}
+			readonly := make([]byte, rLen)
+			copy(readonly, b[pos:pos+rLen])
+			pos += rLen
+
+			atls = append(atls, MessageAddressTableLookup{
+				AccountKey:      key,
+				WritableIndexes: writable,
+				ReadonlyIndexes: readonly,
+			})
+		}
+	}
+
+	return pos, VersionedMessage{
+		IsV0:                isV0,
+		Header:              header,
+		AccountKeys:         accountKeys,
+		RecentBlockhash:     blockhash,
+		Instructions:        instructions,
+		AddressTableLookups: atls,
+	}, true, nil
+}
+
+func decodeCompactU16(b []byte, pos int) (int, int) {
+	if pos >= len(b) {
+		return 0, -1
+	}
+	b0 := b[pos]
 	if b0 < 0x80 {
 		return int(b0), 1
 	}
-
-	if pos+1 >= len(buf) {
+	if pos+1 >= len(b) {
 		return 0, -1
 	}
-	b1 := buf[pos+1]
+	b1 := b[pos+1]
 	if b1 < 0x80 {
 		return int(b0&0x7F) | (int(b1) << 7), 2
 	}
-
-	if pos+2 >= len(buf) {
+	if pos+2 >= len(b) {
 		return 0, -1
 	}
-	b2 := buf[pos+2]
-	return int(b0&0x7F) | (int(b1&0x7F) << 7) | (int(b2) << 14), 3
+	b2 := b[pos+2]
+	if b2 > 0x03 {
+		return 0, -1
+	}
+	return int(b0&0x7F) | (int(b1&0x7F) << 7) | (int(b2&0x03) << 14), 3
+}
+
+func encodeCompactU16(v int) []byte {
+	if v < 0x80 {
+		return []byte{byte(v)}
+	}
+	if v < 0x4000 {
+		return []byte{byte(v&0x7F) | 0x80, byte((v >> 7) & 0xFF)}
+	}
+	return []byte{byte(v&0x7F) | 0x80, byte(((v >> 7) & 0x7F) | 0x80), byte((v >> 14) & 0xFF)}
 }

@@ -2,29 +2,44 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"syscall"
 
-	shredstream "github.com/shredstream/shredstream-sdk-go"
+	shredstream "github.com/shredstream/shredstream-sdk-go/v2"
 )
 
 func main() {
-	listener, err := shredstream.NewListener(8001)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bind failed: %v\n", err)
-		os.Exit(1)
+	port := 8001
+	if v := os.Getenv("SHREDSTREAM_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
 	}
 
-	listener.OnTransactions(func(slot uint64, txs []shredstream.Transaction) {
-		for _, tx := range txs {
-			fmt.Println(tx.Signature())
-		}
-	})
+	listener, err := shredstream.Bind(port)
+	if err != nil {
+		log.Fatalf("bind: %v", err)
+	}
+	defer listener.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	addr, _ := listener.LocalAddr()
+	log.Printf("listening on %s", addr)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintln(os.Stderr, "Listening on port 8001...")
-	listener.Start(ctx)
+	iter := listener.Transactions(ctx)
+	for iter.Next() {
+		slot, txs := iter.Slot(), iter.Txs()
+		for _, tx := range txs {
+			if len(tx.Signatures) > 0 {
+				fmt.Printf("slot=%d sig=%s\n", slot, hex.EncodeToString(tx.Signatures[0][:]))
+			}
+		}
+	}
 }

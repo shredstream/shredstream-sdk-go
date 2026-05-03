@@ -33,7 +33,7 @@ Solana ShredStream SDK/Decoder for Go, enabling ultra-low latency Solana transac
 go mod init myproject
 
 # Install the SDK
-go get github.com/shredstream/shredstream-sdk-go
+go get github.com/shredstream/shredstream-sdk-go/v2
 ```
 
 ## ⚡ Quick Start
@@ -48,33 +48,25 @@ import (
     "fmt"
     "log"
     "os"
-    "os/signal"
     "strconv"
 
-    shredstream "github.com/shredstream/shredstream-sdk-go"
+    shredstream "github.com/shredstream/shredstream-sdk-go/v2"
 )
 
 func main() {
     port, _ := strconv.Atoi(os.Getenv("SHREDSTREAM_PORT"))
     if port == 0 { port = 8001 }
 
-    listener, err := shredstream.NewListener(port)
-    if err != nil {
-        log.Fatal(err)
-    }
+    listener, err := shredstream.Bind(port)
+    if err != nil { log.Fatal(err) }
+    defer listener.Close()
 
-    // Decoded transactions — ready-to-use Solana transactions
-    listener.OnTransactions(func(slot uint64, txs []shredstream.Transaction) {
+    iter := listener.Transactions(context.Background())
+    for iter.Next() {
+        slot, txs := iter.Slot(), iter.Txs()
         for _, tx := range txs {
-            fmt.Printf("slot %d: %s\n", slot, tx.Signature())
+            fmt.Printf("slot %d: %x\n", slot, tx.Signatures[0])
         }
-    })
-
-    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-    defer stop()
-
-    if err := listener.Start(ctx); err != nil {
-        log.Fatal(err)
     }
 }
 ```
@@ -87,33 +79,59 @@ go run main.go
 
 ## 📖 API Reference
 
-### `NewListener(port int) (*ShredListener, error)`
+### `Listener`
 
-Creates a listener with default options (25 MB recv buf, 10 slot max age).
+- `shredstream.Bind(port int) (*Listener, error)` — Bind with defaults (64 MB recv buf, 3 slot window, FEC enabled)
+- `shredstream.BindWithOptions(port int, opts ListenerOptions) (*Listener, error)` — Custom configuration
+- `shredstream.Offline() *Listener` / `OfflineWithOptions(opts) *Listener` — No socket; drive via `HandlePacket` (replay/tests)
+- `shredstream.FromConn(conn net.PacketConn, opts) *Listener` — Adopt an existing connection
+- `listener.Transactions(ctx) *TransactionIter` — Blocking iterator yielding `(slot, []VersionedTransaction)`
+- `listener.Shreds(ctx) *ShredIter` — Iterator of raw shred headers (no decode)
+- `listener.HandlePacket(raw []byte) (uint64, []VersionedTransaction, bool)` — Inject an externally-received UDP datagram
+- `listener.LocalAddr() (net.Addr, error)` — Bound socket address
+- `listener.SetReadDeadline(t time.Time) error` — Forward to underlying socket
+- `listener.Close() error` — Release the socket and pool
 
-### `NewListenerWithOptions(port int, opts ...ListenerOption) (*ShredListener, error)`
+### `ListenerOptions`
 
-| Option | Function | Default | Description |
-|--------|----------|---------|-------------|
-| `WithRecvBuf(size)` | `ListenerOption` | 25 MB | UDP receive buffer size |
-| `WithMaxAge(slots)` | `ListenerOption` | 10 | Maximum slot age before eviction |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `RecvBuf` | `int` | `64 MB` | `SO_RCVBUF` size |
+| `MaxAge` | `int` | `3` | Slot retention window |
+| `BusyPollMicros` | `uint32` | `200` | Linux `SO_BUSY_POLL` µs (0 disables) |
+| `PoolSize` | `int` | `4096` | Number of 2 KiB buffers in the zero-copy pool |
+| `EnableFEC` | `bool` | `true` | Reed-Solomon recovery on dropped data shreds |
+| `DisableSalvageDelivery` | `bool` | `false` | Drop salvaged tail txs for lowest p99 |
+| `Accumulator` | `AccumulatorConfig` | *defaults* | FEC and stuck-batch tuning |
 
-#### Methods
+`shredstream.DefaultListenerOptions()` returns the defaults above.
 
-- `listener.OnTransactions(func(uint64, []Transaction))` -- Register callback for decoded transactions
-- `listener.Start(ctx context.Context) error` -- Start listening (blocks until context cancelled)
-- `listener.Stop()` -- Stop the listener
-- `listener.ActiveSlots() int` -- Number of slots currently being accumulated
+### `AccumulatorConfig`
 
-### `Transaction`
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `MaxFECSetsPerSlot` | `int` | `32` | Per-slot FEC buffer cap |
+| `StuckBatchTimeout` | `time.Duration` | `50ms` | Force-finalize a stuck batch after this delay |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `Signatures` | `[][]byte` | Raw 64-byte signatures |
-| `Raw` | `[]byte` | Full wire-format transaction bytes |
+### Metrics
 
-Methods:
-- `tx.Signature() string` -- First signature as base58
+Lock-free atomic counters on `*Listener`:
+
+| Group | Methods |
+|-------|---------|
+| **Throughput** | `DataShredCountTotal`, `CodeShredCountTotal`, `BytesReceived`, `SlotCount` |
+| **Decoder** | `BatchesDecodedStreamingTotal`, `BatchesDecodedFallbackTotal`, `BatchesSkippedTotal`, `DecodeErrorsTotal` |
+| **FEC** | `FECRecoveriesTotal`, `FECRecoveryFailuresTotal`, `FECSetsDiscardedUnusedTotal`, `FECSetsEvictedEarlyTotal` |
+| **Unparseable** | `UnparseablePackets`, `UnparseableTooShort`, `UnparseableVariant`, `UnparseablePayload`, `UnparseableSlotRange` |
+| **Slot lifecycle** | `SlotsCompletedTotal`, `SlotsEvictedByAge`, `DroppedKnownSlots`, `HarvestedBatchesTotal`, `SalvagedTailTxTotal` |
+| **Tail control** | `BatchesForceFinalizedCorruptedTotal`, `BatchesForceFinalizedTimeoutTotal` |
+| **Pool / I-O** | `PoolExhaustedCount`, `LastIOErrorKind`, `BusyPollActive` |
+
+### Helpers
+
+- `shredstream.ClassifyVariant(b byte) (VariantKind, bool)` — Classify a shred variant byte
+- `shredstream.PinThreadToCPU(cpu int) error` — Pin the calling goroutine. Pair with `runtime.LockOSThread()`. Linux: `sched_setaffinity`; macOS: hint; other: no-op
+- `shredstream.LockOSThread()` — Convenience wrapper around `runtime.LockOSThread`
 
 ## 🎯 Use Cases
 
@@ -125,18 +143,21 @@ ShredStream.com SDK detects PumpFun token creations **~499ms before they appear 
 
 <img src="https://raw.githubusercontent.com/shredstream/shredstream-sdk-go/main/assets/shredstream.com_sdk_vs_pumpfun_live_feed.gif" alt="ShredStream.com SDK vs PumpFun live feed — ~499ms advantage" width="600">
 
-> [ShredStream.com](https://shredstream.com) provides a complete, optimized PumpFun token creation detection code available with our monthly subscription plan. Battle-tested, high-performance, ready to plug into your sniping pipeline. To get access, open a ticket on [Discord](https://discord.gg/4w2DNbTaWD) or reach out on Telegram [@shredstream](https://t.me/shredstream).
+> Ready-to-run example included: see [`examples/pumpfun_creates`](examples/pumpfun_creates). Run with `go run ./examples/pumpfun_creates [port]`.
 
 ## ⚙️ Configuration
 
 ### OS Tuning
 
+For high-throughput environments, increase the kernel receive buffer:
+
 ```bash
-# Linux — increase max receive buffer
-sudo sysctl -w net.core.rmem_max=33554432
+# Linux
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.busy_read=200
 
 # macOS
-sudo sysctl -w kern.ipc.maxsockbuf=33554432
+sudo sysctl -w kern.ipc.maxsockbuf=67108864
 ```
 
 ## 🚀 Launch a Shred Stream
